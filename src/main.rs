@@ -18,6 +18,19 @@ fn modified_time(file: &str) -> std::time::SystemTime {
 }
 
 
+/// Check if a file is a symlink
+fn is_symlink(file: &str) -> i32 {
+    match fs::symlink_metadata(file) {
+        Ok(metadata) => if metadata.file_type().is_symlink() {
+            return 0;
+        } else {
+            return 1;
+        },
+        Err(_) => return 2,
+    }
+}
+
+
 /// Recursively iterate through the destination directory to remove the files
 /// that are not in the source directory
 fn remove_removed(source: &str, destination: &str, dry_run: bool) {
@@ -42,13 +55,46 @@ fn remove_removed(source: &str, destination: &str, dry_run: bool) {
             // If the file doesn't exist in the source directory,
             // remove it from the destination directory
             let file_name = path.file_name().unwrap();
-            let source_file = format!("{}/{}", source, file_name.to_str().unwrap());
-            if !Path::new(&source_file).exists() {
-                println!("Removing file: {}", path.to_str().unwrap());
-                if !dry_run {
-                    fs::remove_file(path).unwrap();
+            let file_name_str = match file_name.to_str() {
+                Some(s) => s,
+                None => continue,
+            };
+            let source_file = format!("{}/{}", source, file_name_str);
+            if is_symlink(path.to_str().unwrap()) == 0 {
+                match fs::read_link(source_file) {
+                    Ok(_) => (),
+                    Err(_) => {
+                        println!("Removing symlink: {}", path.to_str().unwrap());
+                        if !dry_run {
+                            fs::remove_dir_all(path.clone()).unwrap();
+                        }
+                    }
+                }
+            } else {
+                if !Path::new(&source_file).exists() {
+                    println!("Removing file: {}", path.to_str().unwrap());
+                    if !dry_run {
+                        fs::remove_file(path).unwrap();
+                    }
                 }
             }
+        }
+    }
+}
+
+
+fn copy_file(source: &str, destination: &str, dry_run: bool) {
+    println!("Copying {} to {}", source, destination);
+    if !dry_run {
+        if is_symlink(source) == 0 {
+            // Create a symlink in the destination directory
+            // pointing to the source file
+            // This is a workaround for the fs::copy() function
+            // not working with symlinks
+            let source = fs::read_link(source).unwrap();
+            std::os::unix::fs::symlink(source, destination.clone()).unwrap();
+        } else {
+            fs::copy(source, destination).unwrap();
         }
     }
 }
@@ -59,7 +105,13 @@ fn backup(source: &str, destination: &str, dry_run: bool) {
     // Get a list (recursively) of the files in the source directory
     // and copy them to the destination directory, preserving the
     // directory structure
-    for entry in fs::read_dir(source).unwrap() {
+    let dir = match fs::read_dir(source) {
+        Ok(d) => d,
+        Err(_) => {
+            return;
+        }
+    };
+    for entry in dir {
         let entry = entry.unwrap();
         let path = entry.path();
         if path.is_dir() {
@@ -77,28 +129,38 @@ fn backup(source: &str, destination: &str, dry_run: bool) {
         } else {
             // Copy the file to the destination directory
             let file_name = path.file_name().unwrap();
-            let destination_file = format!("{}/{}", destination, file_name.to_str().unwrap());
-            if Path::new(&destination_file).exists() {
-                // Get size of both files, and if they are different, overwrite
-                // the destination file
-                if size(path.to_str().unwrap()) != size(&destination_file) {
-                    println!("Copying {} to {}", path.to_str().unwrap(), destination_file);
-                    if !dry_run {
-                        fs::copy(path, destination_file).unwrap();
+            let file_name_str = match file_name.to_str() {
+                Some(s) => s,
+                None => continue,
+            };
+            let destination_file = format!("{}/{}", destination, file_name_str);
+            let source_file = path.to_str().unwrap();
+            if is_symlink(source_file) == 0 {
+                if is_symlink(&destination_file) == 0 {
+                    // If the symlink in the source directory points to a different
+                    // file than the symlink in the destination directory, overwrite
+                    // the destination symlink
+                    let source = fs::read_link(source_file).unwrap();
+                    let destination = fs::read_link(&destination_file).unwrap();
+                    if source != destination {
+                        copy_file(source_file, &destination_file, dry_run);
                     }
                 } else {
-                    if modified_time(path.to_str().unwrap()) > modified_time(&destination_file) {
-                        println!("Copying {} to {}", path.to_str().unwrap(), destination_file);
-                        if !dry_run {
-                            fs::copy(path, destination_file).unwrap();
-                        }
+                    // If the destination file is not a symlink, overwrite it
+                    copy_file(source_file, &destination_file, dry_run);
+                }
+            } else if Path::new(&destination_file).exists() {
+                // Get size of both files, and if they are different, overwrite
+                // the destination file
+                if size(source_file) != size(&destination_file) {
+                    copy_file(source_file, &destination_file, dry_run);
+                } else {
+                    if modified_time(source_file) > modified_time(&destination_file) {
+                        copy_file(source_file, &destination_file, dry_run);
                     }
                 }
             } else {
-                println!("Copying {} to {}", path.to_str().unwrap(), destination_file);
-                if !dry_run {
-                    fs::copy(path, destination_file).unwrap();
-                }
+                copy_file(source_file, &destination_file, dry_run);
             }
         }
     }
